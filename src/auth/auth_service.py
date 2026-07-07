@@ -1,33 +1,73 @@
-import streamlit as st
-from supabase import create_client
-from datetime import datetime
-import time
+import os
 import re
+import streamlit as st
+from datetime import datetime
+from supabase import create_client
 
 
 class AuthService:
     def __init__(self):
+        self.supabase = None
+        self.configured = False
+        self.init_error = None
+
         try:
-            # Initialize Supabase client directly
-            # This ensures a fresh client for each session, preventing state leakage
-            self.supabase = create_client(
-                st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"]
-            )
+            self._initialize_client()
         except Exception as e:
+            self.init_error = str(e)
+            st.session_state.auth_error = self.init_error
             st.error(f"Failed to initialize services: {str(e)}")
-            raise e
 
-        # Try to restore session from Supabase if no current session
-        self.try_restore_session()
+        if self.configured:
+            # Try to restore session from Supabase if no current session
+            self.try_restore_session()
 
-        # Validate session on initialization
-        if "auth_token" in st.session_state:
-            if not self.validate_session_token():
-                # Don't sign out immediately on failure during init to avoid loop
-                pass
+            # Validate session on initialization
+            if "auth_token" in st.session_state:
+                if not self.validate_session_token():
+                    # Don't sign out immediately on failure during init to avoid loop
+                    pass
+
+    def _get_secret(self, key, env_key=None):
+        try:
+            value = st.secrets.get(key)
+        except Exception:
+            value = None
+
+        if value:
+            return value
+
+        if env_key:
+            env_value = os.getenv(env_key)
+            if env_value:
+                return env_value
+
+        return None
+
+    def _initialize_client(self):
+        supabase_url = self._get_secret("SUPABASE_URL", "SUPABASE_URL")
+        supabase_key = self._get_secret("SUPABASE_KEY", "SUPABASE_KEY")
+
+        if not supabase_url or not supabase_key:
+            self.configured = False
+            self.supabase = None
+            self.init_error = (
+                "Supabase credentials are not configured. "
+                "Add SUPABASE_URL and SUPABASE_KEY to Streamlit secrets or environment variables."
+            )
+            st.session_state.auth_error = self.init_error
+            return
+
+        # Initialize Supabase client directly
+        # This ensures a fresh client for each session, preventing state leakage
+        self.supabase = create_client(supabase_url, supabase_key)
+        self.configured = True
 
     def try_restore_session(self):
         """Try to restore session from Supabase stored session."""
+        if not self.configured or self.supabase is None:
+            return
+
         try:
             # First try to restore from Streamlit session state tokens
             if "auth_token" in st.session_state and "refresh_token" in st.session_state:
@@ -64,6 +104,9 @@ class AuthService:
 
     def check_existing_user(self, email):
         """Check if user already exists."""
+        if not self.configured or self.supabase is None:
+            return False
+
         try:
             result = (
                 self.supabase.table("users").select("id").eq("email", email).execute()
@@ -73,6 +116,9 @@ class AuthService:
             return False
 
     def sign_up(self, email, password, name):
+        if not self.configured or self.supabase is None:
+            return False, "Authentication is unavailable because Supabase credentials are not configured."
+
         try:
             auth_response = self.supabase.auth.sign_up(
                 {
@@ -88,12 +134,22 @@ class AuthService:
             user_data = {
                 "id": auth_response.user.id,
                 "email": email,
-                "name": name,
                 "created_at": datetime.now().isoformat(),
             }
+            if name:
+                user_data["name"] = name
 
-            # Insert user data into users table
-            self.supabase.table("users").insert(user_data).execute()
+            # Insert user data into users table.
+            # Fallback if the table schema does not include the name column yet.
+            try:
+                self.supabase.table("users").insert(user_data).execute()
+            except Exception as insert_error:
+                error_text = str(insert_error)
+                if "Could not find the 'name' column" in error_text or "could not find column \"name\"" in error_text.lower():
+                    user_data.pop("name", None)
+                    self.supabase.table("users").insert(user_data).execute()
+                else:
+                    raise
 
             # If we got a session immediately (email confirmation off), store it
             if auth_response.session:
@@ -107,9 +163,17 @@ class AuthService:
             error_msg = str(e).lower()
             if "duplicate" in error_msg or "already registered" in error_msg:
                 return False, "Email already registered"
+            if "rate limit" in error_msg or "email rate limit exceeded" in error_msg:
+                return False, (
+                    "Email rate limit exceeded. Please wait a few minutes and try again, "
+                    "or use a different email address."
+                )
             return False, f"Sign up failed: {str(e)}"
 
     def sign_in(self, email, password):
+        if not self.configured or self.supabase is None:
+            return False, "Authentication is unavailable because Supabase credentials are not configured."
+
         try:
             # Clear any existing session data first
             # But don't call sign_out() which destroys auth_service in session_state
@@ -141,6 +205,9 @@ class AuthService:
 
     def sign_out(self):
         """Sign out and clear all session data."""
+        if not self.configured or self.supabase is None:
+            return False, "Authentication is unavailable because Supabase credentials are not configured."
+
         try:
             self.supabase.auth.sign_out()
         except Exception:
@@ -155,12 +222,18 @@ class AuthService:
             return False, str(e)
 
     def get_user(self):
+        if not self.configured or self.supabase is None:
+            return None
+
         try:
             return self.supabase.auth.get_user()
         except Exception:
             return None
 
     def create_session(self, user_id, title=None):
+        if not self.configured or self.supabase is None:
+            return False, "Authentication is unavailable because Supabase credentials are not configured."
+
         try:
             current_time = datetime.now()
             default_title = f"{current_time.strftime('%d-%m-%Y')} | {current_time.strftime('%H:%M:%S')}"
@@ -176,6 +249,9 @@ class AuthService:
             return False, str(e)
 
     def get_user_sessions(self, user_id):
+        if not self.configured or self.supabase is None:
+            return False, []
+
         try:
             result = (
                 self.supabase.table("chat_sessions")
@@ -190,6 +266,9 @@ class AuthService:
             return False, []
 
     def save_chat_message(self, session_id, content, role="user"):
+        if not self.configured or self.supabase is None:
+            return False, "Authentication is unavailable because Supabase credentials are not configured."
+
         try:
             message_data = {
                 "session_id": session_id,
@@ -203,6 +282,9 @@ class AuthService:
             return False, str(e)
 
     def get_session_messages(self, session_id):
+        if not self.configured or self.supabase is None:
+            return False, []
+
         try:
             result = (
                 self.supabase.table("chat_messages")
@@ -216,6 +298,9 @@ class AuthService:
             return False, str(e)
 
     def delete_session(self, session_id):
+        if not self.configured or self.supabase is None:
+            return False, "Authentication is unavailable because Supabase credentials are not configured."
+
         try:
             self.supabase.table("chat_messages").delete().eq(
                 "session_id", session_id
@@ -230,6 +315,9 @@ class AuthService:
 
     def validate_session_token(self):
         """Validate existing session token on startup."""
+        if not self.configured or self.supabase is None:
+            return None
+
         try:
             session = self.supabase.auth.get_session()
             if not session or not session.access_token:
